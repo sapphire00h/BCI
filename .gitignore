@@ -1,0 +1,35 @@
+# 数据集、预处理数据与训练结果
+/Data/
+
+# 本地编辑器配置
+/.vscode/
+
+# Python 缓存与工具缓存
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter Notebook 检查点
+.ipynb_checkpoints/
+
+# 本地虚拟环境
+/.venv/
+/venv/
+/env/
+/.conda/
+
+# 本地环境配置
+.env
+.env.*
+!.env.example
+
+# 日志与模型权重
+*.log
+*.pt
+*.pth
+*.ckpt
+
+/other/
+/results/
