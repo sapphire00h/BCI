@@ -96,7 +96,7 @@ def adapt_input(X, model_name):
     
     canonical = X[:, None, :, :] # 新增一个维度
 
-    if model_name in ("CustomEEGNet", "CustomEEGTCNet", "EEGNex"):
+    if model_name in ("CustomEEGNet", "CustomEEGTCNet", "CustomEEGNex"):
         return canonical # 返回四个维度
     
     return canonical[:, 0, :, :] #返回三个维度
