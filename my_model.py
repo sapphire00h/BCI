@@ -881,7 +881,7 @@ class ImprovedTCFormerV1(nn.Module):
 
         # Stage 4
         d_model=48,
-        trans_depth=5,
+        trans_depth=6,
         q_heads=8,
         kv_heads=4,
         trans_dropout=0.4,
