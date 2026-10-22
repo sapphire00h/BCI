@@ -111,6 +111,11 @@ class EEGNet(nn.Module):
 
 
 
+
+
+
+
+
 # 以下 EEG-TCNet 及其辅助类来自 是馒头阿（mantoudamahou）的复现代码。
 # 来源：https://blog.csdn.net/mantoudamahou/article/details/134990549
 # 原文及本段改编代码遵循 CC BY-SA 4.0：
@@ -353,6 +358,11 @@ class EEGTCNet(nn.Module):
 
 
 
+
+
+
+
+
 class EEGNex(nn.Module):
     def __init__(self, channels=22, samples=1001, n_classes=4,
                  F1=8, F2=32, D=2):
@@ -398,639 +408,396 @@ class EEGNex(nn.Module):
 
 
 
+
+
 # Adapted from https://github.com/Altaheri/TCFormer
 # Original copyright (c) 2025 Hamdi Altaheri
 # Original project license: MIT
-class ChannelGroupAttention(nn.Module):
-    """为每组特征学习一个注意力系数。"""
+def _itcf_xavier_init(module):
+    for layer in module.modules():
+        if isinstance(layer, (nn.Conv1d, nn.Conv2d, nn.Linear)):
+            nn.init.xavier_uniform_(layer.weight)
+            if layer.bias is not None:
+                nn.init.zeros_(layer.bias)
 
-    def __init__(self, in_channels, groups, reduction=4):
+
+class _ITCFGroupAttention(nn.Module):
+    def __init__(self, channels, groups):
         super().__init__()
-        hidden = in_channels // reduction
-
-        if hidden % groups:
-            raise ValueError("in_channels // reduction 必须能被 groups 整除")
-
         self.groups = groups
-        self.group_size = in_channels // groups
-
+        self.group_size = channels // groups
         self.pool = nn.AdaptiveAvgPool2d(1)
-        self.attention = nn.Sequential(
-            nn.Conv2d(in_channels, hidden, 1,
-                      groups=groups, bias=False),
-            nn.ReLU(),
-            nn.Conv2d(hidden, groups, 1,
-                      groups=groups, bias=False),
-            nn.Sigmoid(),
+        self.fc1 = nn.Conv2d(
+            channels, channels // 4, 1, groups=groups, bias=False
+        )
+        self.fc2 = nn.Conv2d(
+            channels // 4, groups, 1, groups=groups, bias=False
         )
 
     def forward(self, x):
-        b, c, h, w = x.shape
-        a = self.attention(self.pool(x)).reshape(
-            b, self.groups, 1, 1, 1
+        batch, _, height, width = x.shape
+        weights = torch.sigmoid(self.fc2(F.relu(self.fc1(self.pool(x)))))
+        weights = weights.view(batch, self.groups, 1, 1, 1)
+        grouped = x.reshape(
+            batch, self.groups, self.group_size, height, width
         )
-
-        return (
-            x.reshape(b, self.groups, self.group_size, h, w) * a
-        ).reshape(b, c, h, w)
+        return (grouped * weights).reshape_as(x)
 
 
-class CausalConv1d(nn.Conv1d):
-    """只在时间轴左侧补零的因果卷积。"""
+class _ITCFConvStem(nn.Module):
+    def __init__(
+        self,
+        channels,
+        temporal_kernels,
+        f1,
+        depth_multiplier,
+        group_dim,
+        pool1,
+        pool2,
+        dropout,
+    ):
+        super().__init__()
+        groups = len(temporal_kernels)
+        stem_channels = f1 * groups
+        spatial_channels = stem_channels * depth_multiplier
+        model_dim = group_dim * groups
 
-    def __init__(self, in_channels, out_channels,
-                 kernel_size, dilation=1, groups=1):
-        super().__init__(
-            in_channels, out_channels,
-            kernel_size, dilation=dilation,
-            groups=groups, bias=True
+        self.temporal = nn.ModuleList()
+        for kernel in temporal_kernels:
+            left = (kernel - 1) // 2
+            right = kernel - 1 - left
+            self.temporal.append(
+                nn.Sequential(
+                    nn.ConstantPad2d((left, right, 0, 0), 0),
+                    nn.Conv2d(1, f1, (1, kernel), bias=False),
+                    nn.BatchNorm2d(f1),
+                )
+            )
+
+        self.spatial = nn.Sequential(
+            nn.Conv2d(
+                stem_channels,
+                spatial_channels,
+                (channels, 1),
+                groups=stem_channels,
+                bias=False,
+            ),
+            nn.BatchNorm2d(spatial_channels),
+            nn.ELU(),
         )
-        self.left_padding = (kernel_size - 1) * dilation
+        self.pool1 = nn.AvgPool2d((1, pool1))
+        self.drop1 = nn.Dropout(dropout)
+
+        self.reduction = nn.Sequential(
+            nn.Conv2d(
+                spatial_channels,
+                model_dim,
+                1,
+                groups=groups,
+                bias=False,
+            ),
+            nn.BatchNorm2d(model_dim),
+        )
+        self.grouped_temporal = nn.Sequential(
+            nn.Conv2d(
+                model_dim,
+                model_dim,
+                (1, 16),
+                padding="same",
+                groups=groups,
+                bias=False,
+            ),
+            nn.BatchNorm2d(model_dim),
+            nn.ELU(),
+        )
+        self.group_attention = _ITCFGroupAttention(model_dim, groups)
+        self.pool2 = nn.AvgPool2d((1, pool2))
+        self.drop2 = nn.Dropout(dropout)
+
+        _itcf_xavier_init(self)
 
     def forward(self, x):
-        return super().forward(
-            F.pad(x, (self.left_padding, 0))
+        x = x.unsqueeze(1)  # (B, 1, C, T)
+        x = torch.cat([branch(x) for branch in self.temporal], dim=1)
+        x = self.drop1(self.pool1(self.spatial(x)))
+        x = self.grouped_temporal(self.reduction(x))
+        x = x + self.group_attention(x)
+        return self.drop2(self.pool2(x)).squeeze(2)
+
+
+class _ITCFDropPath(nn.Module):
+    def __init__(self, probability):
+        super().__init__()
+        self.probability = probability
+
+    def forward(self, x):
+        if not self.training or self.probability == 0:
+            return x
+        keep = 1.0 - self.probability
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        mask = (keep + torch.rand(shape, device=x.device, dtype=x.dtype)).floor()
+        return x * mask / keep
+
+
+def _itcf_rotary_cache(head_dim, length, device):
+    frequencies = 1.0 / (
+        10000 ** (
+            torch.arange(0, head_dim, 2, device=device).float() / head_dim
+        )
+    )
+    positions = torch.arange(length, device=device).float()
+    angles = torch.outer(positions, frequencies)
+    angles = torch.repeat_interleave(
+        angles, repeats=2, dim=-1
+    )
+    # angles = torch.cat((angles, angles), dim=-1)
+    return angles.cos(), angles.sin()
+
+
+def _itcf_rotate(x):
+    even, odd = x[..., ::2], x[..., 1::2]
+    return torch.stack((-odd, even), dim=-1).flatten(-2)
+
+
+class _ITCFGroupedQueryAttention(nn.Module):
+    def __init__(self, model_dim, query_heads, kv_heads, dropout):
+        super().__init__()
+        if model_dim % query_heads or query_heads % kv_heads:
+            raise ValueError("model_dim、query_heads、kv_heads 不兼容")
+
+        self.query_heads = query_heads
+        self.kv_heads = kv_heads
+        self.head_dim = model_dim // query_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.q_proj = nn.Linear(model_dim, model_dim, bias=False)
+        self.kv_proj = nn.Linear(
+            model_dim, 2 * kv_heads * self.head_dim, bias=False
+        )
+        self.out_proj = nn.Linear(model_dim, model_dim, bias=False)
+        self.dropout = nn.Dropout(dropout)
+        _itcf_xavier_init(self)
+
+    def forward(self, x, cosine, sine):
+        batch, length, model_dim = x.shape
+        q = self.q_proj(x).reshape(
+            batch, length, self.query_heads, self.head_dim
+        ).transpose(1, 2)
+
+        kv = self.kv_proj(x).reshape(
+            batch, length, self.kv_heads, 2, self.head_dim
+        )
+        k = kv[..., 0, :].transpose(1, 2)
+        v = kv[..., 1, :].transpose(1, 2)
+
+        repeat = self.query_heads // self.kv_heads
+        k = k.repeat_interleave(repeat, dim=1)
+        v = v.repeat_interleave(repeat, dim=1)
+
+        cosine = cosine[:length]
+        sine = sine[:length]
+        q = q * cosine + _itcf_rotate(q) * sine
+        k = k * cosine + _itcf_rotate(k) * sine
+
+        weights = (q @ k.transpose(-2, -1)) * self.scale
+        weights = self.dropout(weights.softmax(dim=-1))
+        result = weights @ v
+        result = result.transpose(1, 2).contiguous()
+        result = result.reshape(batch, length, model_dim)
+        return self.out_proj(result)
+
+
+class _ITCFTransformerBlock(nn.Module):
+    def __init__(
+        self, model_dim, query_heads, kv_heads, dropout, drop_path
+    ):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(model_dim)
+        self.attention = _ITCFGroupedQueryAttention(
+            model_dim, query_heads, kv_heads, dropout
+        )
+        self.drop_path = _ITCFDropPath(drop_path)
+        self.norm2 = nn.LayerNorm(model_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(model_dim, 2 * model_dim),
+            nn.GELU(),
+            nn.Linear(2 * model_dim, model_dim),
+            nn.Dropout(dropout),
         )
 
-
-class MaxNormConv1d(nn.Conv1d):
-    """带 MaxNorm 权重约束的分类卷积。"""
-
-    def __init__(self, in_channels, out_channels,
-                 kernel_size=1, groups=1, max_norm=0.25):
-        super().__init__(
-            in_channels, out_channels, kernel_size,
-            groups=groups, bias=True
+    def forward(self, x, cosine, sine):
+        x = x + self.drop_path(
+            self.attention(self.norm1(x), cosine, sine)
         )
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x
+
+
+class _ITCFCausalConv1d(nn.Conv1d):
+    def forward(self, x):
+        left = (self.kernel_size[0] - 1) * self.dilation[0]
+        return super().forward(F.pad(x, (left, 0)))
+
+
+class _ITCFTCNBlock(nn.Module):
+    def __init__(self, features, groups, kernel, dilation, dropout):
+        super().__init__()
+        self.conv1 = _ITCFCausalConv1d(
+            features, features, kernel,
+            dilation=dilation, groups=groups
+        )
+        self.bn1 = nn.BatchNorm1d(features)
+        self.drop1 = nn.Dropout(dropout)
+        self.conv2 = _ITCFCausalConv1d(
+            features, features, kernel,
+            dilation=dilation, groups=groups
+        )
+        self.bn2 = nn.BatchNorm1d(features)
+        self.drop2 = nn.Dropout(dropout)
+        nn.init.zeros_(self.conv1.bias)
+        nn.init.zeros_(self.conv2.bias)
+
+    def forward(self, x):
+        residual = x
+        x = self.drop1(F.elu(self.bn1(self.conv1(x))))
+        x = self.drop2(F.elu(self.bn2(self.conv2(x))))
+        return F.elu(residual + x)
+
+
+class _ITCFMaxNormConv1d(nn.Conv1d):
+    def __init__(self, *args, max_norm=0.25, **kwargs):
+        super().__init__(*args, **kwargs)
         self.max_norm = max_norm
 
     def forward(self, x):
         with torch.no_grad():
             self.weight.copy_(
                 torch.renorm(
-                    self.weight, p=2, dim=0,
-                    maxnorm=self.max_norm
+                    self.weight, p=2, dim=0, maxnorm=self.max_norm
                 )
             )
         return super().forward(x)
 
 
-class MultiKernelConvBlock(nn.Module):
-    """
-    多尺度时间卷积
-      -> EEG 空间卷积
-      -> 分组时间卷积
-      -> Channel Group Attention
-    """
-
-    def __init__(
-        self, channels, kernels, F1, D,
-        pool1, pool2, dropout,
-        d_group, use_group_attn
-    ):
-        super().__init__()
-
-        self.groups = len(kernels)
-        total_filters = F1 * self.groups
-        expanded_filters = total_filters * D
-        self.d_model = d_group * self.groups
-
-        # Block 1: 多分支时间卷积
-        self.temporal_branches = nn.ModuleList([
-            nn.Sequential(
-                nn.ZeroPad2d(
-                    (k // 2 - 1, k // 2, 0, 0)
-                    if k % 2 == 0
-                    else (k // 2, k // 2, 0, 0)
-                ),
-                nn.Conv2d(
-                    1, F1, kernel_size=(1, k),
-                    bias=False
-                ),
-                nn.BatchNorm2d(F1)
-            )
-            for k in kernels
-        ])
-
-        # Block 2: Depthwise EEG 空间卷积
-        self.spatial = nn.Sequential(
-            nn.Conv2d(
-                total_filters, expanded_filters,
-                kernel_size=(channels, 1),
-                groups=total_filters,
-                bias=False
-            ),
-            nn.BatchNorm2d(expanded_filters),
-            nn.ELU(),
-            nn.AvgPool2d((1, pool1)),
-            nn.Dropout(dropout),
-        )
-
-        # Block 3: 分组 1x1 特征降维
-        if expanded_filters != self.d_model:
-            self.channel_reduce = nn.Sequential(
-                nn.Conv2d(
-                    expanded_filters, self.d_model,
-                    kernel_size=1,
-                    groups=self.groups,
-                    bias=False
-                ),
-                nn.BatchNorm2d(self.d_model)
-            )
-        else:
-            self.channel_reduce = nn.Identity()
-
-        # Block 4: 分组时间卷积，kernel=(1,16)
-        self.temporal = nn.Sequential(
-            nn.ZeroPad2d((7, 8, 0, 0)),
-            nn.Conv2d(
-                self.d_model, self.d_model,
-                kernel_size=(1, 16),
-                groups=self.groups,
-                bias=False
-            ),
-            nn.BatchNorm2d(self.d_model),
-            nn.ELU(),
-        )
-
-        # Block 5: 分组注意力
-        if self.groups > 1 and use_group_attn:
-            self.group_attention = ChannelGroupAttention(
-                self.d_model, self.groups
-            )
-        else:
-            self.group_attention = None
-
-        self.pool2 = nn.AvgPool2d((1, pool2))
-        self.dropout2 = nn.Dropout(dropout)
-
-        # Xavier 初始化
-        for layer in self.modules():
-            if isinstance(
-                layer, (nn.Conv1d, nn.Conv2d, nn.Linear)
-            ):
-                nn.init.xavier_uniform_(layer.weight)
-
-            if getattr(layer, "bias", None) is not None:
-                nn.init.zeros_(layer.bias)
-
-    def forward(self, x):
-        # (B,C,T) -> (B,1,C,T)
-        x = x.unsqueeze(1)
-
-        # 并行时间卷积后拼接
-        x = torch.cat(
-            [branch(x) for branch in self.temporal_branches],
-            dim=1
-        )
-
-        x = self.spatial(x)
-        x = self.channel_reduce(x)
-        x = self.temporal(x)
-
-        if self.group_attention is not None:
-            x = x + self.group_attention(x)
-
-        x = self.pool2(x)
-        x = self.dropout2(x)
-
-        return x.squeeze(2)
-
-
-class DropPath(nn.Module):
-    """Stochastic Depth。"""
-
-    def __init__(self, p=0.0):
-        super().__init__()
-        self.p = p
-
-    def forward(self, x):
-        if not self.training or self.p == 0:
-            return x
-
-        keep = 1.0 - self.p
-        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-
-        mask = (
-            torch.rand(
-                shape, device=x.device, dtype=x.dtype
-            ) < keep
-        )
-        return x * mask / keep
-
-
-def rotary_cache(seq_len, head_dim, device):
-    """构建 RoPE 位置编码。"""
-
-    theta = 1.0 / (
-        10000.0 ** (
-            torch.arange(
-                0, head_dim, 2, device=device
-            ).float() / head_dim
-        )
-    )
-
-    phase = torch.outer(
-        torch.arange(seq_len, device=device).float(),
-        theta
-    )
-
-    # 与原仓库保持相同的频率布局
-    phase = torch.cat((phase, phase), dim=-1)
-
-    return phase.cos(), phase.sin()
-
-
-def apply_rope(q, k, cos, sin):
-    """对 Q 和 K 应用旋转位置编码。"""
-
-    def rotate_half(x):
-        even = x[..., ::2]
-        odd = x[..., 1::2]
-
-        return torch.stack(
-            (-odd, even), dim=-1
-        ).flatten(-2)
-
-    q = q * cos + rotate_half(q) * sin
-    k = k * cos + rotate_half(k) * sin
-
-    return q, k
-
-
-class GroupedQueryAttention(nn.Module):
-    """Grouped-Query Self-Attention + RoPE。"""
-
-    def __init__(
-        self, d_model, q_heads, kv_heads, dropout
-    ):
-        super().__init__()
-
-        self.q_heads = q_heads
-        self.kv_heads = kv_heads
-        self.head_dim = d_model // q_heads
-
-        self.q_proj = nn.Linear(
-            d_model, d_model, bias=False
-        )
-
-        self.kv_proj = nn.Linear(
-            d_model,
-            2 * kv_heads * self.head_dim,
-            bias=False
-        )
-
-        self.out_proj = nn.Linear(
-            d_model, d_model, bias=False
-        )
-
-        self.attn_drop = nn.Dropout(dropout)
-
-        for layer in (
-            self.q_proj, self.kv_proj, self.out_proj
-        ):
-            nn.init.xavier_uniform_(layer.weight)
-
-    def forward(self, x, cos, sin):
-        b, t, d = x.shape
-
-        # Query 投影
-        q = self.q_proj(x).reshape(
-            b, t, self.q_heads, self.head_dim
-        ).transpose(1, 2)
-
-        # Key / Value 投影
-        kv = self.kv_proj(x).reshape(
-            b, t, self.kv_heads, 2, self.head_dim
-        )
-
-        k = kv[:, :, :, 0, :].transpose(1, 2)
-        v = kv[:, :, :, 1, :].transpose(1, 2)
-
-        # GQA：复制 KV heads
-        repeats = self.q_heads // self.kv_heads
-
-        k = k.repeat_interleave(repeats, dim=1)
-        v = v.repeat_interleave(repeats, dim=1)
-
-        # RoPE
-        q, k = apply_rope(
-            q, k, cos[:t], sin[:t]
-        )
-
-        # Scaled Dot-Product Attention
-        weights = (
-            q @ k.transpose(-2, -1)
-        ) * (self.head_dim ** -0.5)
-
-        weights = self.attn_drop(
-            weights.softmax(dim=-1)
-        )
-
-        output = (
-            weights @ v
-        ).transpose(1, 2).contiguous().reshape(b, t, d)
-
-        return self.out_proj(output)
-
-
-class TransformerBlock(nn.Module):
-    """Pre-LN Transformer Encoder Block。"""
-
-    def __init__(
-        self, d_model, q_heads, kv_heads,
-        dropout, drop_path
-    ):
-        super().__init__()
-
-        self.norm1 = nn.LayerNorm(d_model)
-
-        self.attention = GroupedQueryAttention(
-            d_model, q_heads, kv_heads, dropout
-        )
-
-        self.drop_path = DropPath(drop_path)
-
-        self.norm2 = nn.LayerNorm(d_model)
-
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, 2 * d_model),
-            nn.GELU(),
-            nn.Linear(2 * d_model, d_model),
-            nn.Dropout(dropout),
-        )
-
-    def forward(self, x, cos, sin):
-        x = x + self.drop_path(
-            self.attention(self.norm1(x), cos, sin)
-        )
-
-        x = x + self.drop_path(
-            self.ffn(self.norm2(x))
-        )
-
-        return x
-
-
-class TCNBlock(nn.Module):
-    """两层因果卷积 + Residual Connection。"""
-
-    def __init__(
-        self, features, kernel_length,
-        dilation, groups, dropout
-    ):
-        super().__init__()
-
-        self.block = nn.Sequential(
-            CausalConv1d(
-                features, features, kernel_length,
-                dilation=dilation, groups=groups
-            ),
-            nn.BatchNorm1d(features),
-            nn.ELU(),
-            nn.Dropout(dropout),
-
-            CausalConv1d(
-                features, features, kernel_length,
-                dilation=dilation, groups=groups
-            ),
-            nn.BatchNorm1d(features),
-            nn.ELU(),
-            nn.Dropout(dropout),
-        )
-
-        self.activation = nn.ELU()
-
-        for layer in self.block.modules():
-            if isinstance(layer, CausalConv1d):
-                nn.init.zeros_(layer.bias)
-
-    def forward(self, x):
-        return self.activation(
-            x + self.block(x)
-        )
-
-
-class TCNHead(nn.Module):
-    """TCN + Grouped Classification Head。"""
-
-    def __init__(
-        self, features, groups, depth,
-        kernel_length, dropout, n_classes
-    ):
-        super().__init__()
-
-        self.groups = groups
-        self.n_classes = n_classes
-
-        self.tcn = nn.Sequential(*[
-            TCNBlock(
-                features,
-                kernel_length,
-                2 ** i,
-                groups,
-                dropout
-            )
-            for i in range(depth)
-        ])
-
-        self.classifier = MaxNormConv1d(
-            features,
-            n_classes * groups,
-            kernel_size=1,
-            groups=groups,
-            max_norm=0.25
-        )
-
-    def forward(self, x):
-        x = self.tcn(x)
-
-        # 最后一个时间步
-        x = x[:, :, -1:]
-
-        x = self.classifier(x).squeeze(-1)
-
-        # 每组分别分类，然后求平均
-        x = x.reshape(
-            x.shape[0],
-            self.groups,
-            self.n_classes
-        ).mean(dim=1)
-
-        return x
-
-
 class TCFormer(nn.Module):
     """
-    TCFormer 独立 PyTorch 实现。
-
-    Input:
-        (B, 1, channels, time)
-        或 (B, channels, time)
-
-    Output:
-        (B, n_classes)
+    输入: (B, channels, T) 或 (B, 1, channels, T)
+    输出: (B, n_classes) 原始 logits
     """
 
     def __init__(
         self,
         n_classes=4,
         channels=22,
-        samples=1000,
-
-        F1=16,
-        temp_kernel_lengths=(16, 32, 64),
-        D=2,
-
-        pool_length_1=8,
-        pool_length_2=7,
-        dropout_conv=0.3,
-
-        d_group=16,
-        use_group_attn=True,
-
-        q_heads=8,
-        kv_heads=4,
-        trans_depth=5,
+        samples=1001,
+        temporal_kernels=(20, 32, 64),
+        f1=32,
+        depth_multiplier=2,
+        group_dim=16,
+        pool1=8,
+        pool2=7,
+        conv_dropout=0.4,
+        trans_depth=2,
+        q_heads=4,
+        kv_heads=2,
         trans_dropout=0.4,
         drop_path_max=0.25,
-
         tcn_depth=2,
-        kernel_length_tcn=4,
-        dropout_tcn=0.3,
+        tcn_kernel=4,
+        tcn_dropout=0.3,
     ):
         super().__init__()
+        if trans_depth < 1 or tcn_depth < 1:
+            raise ValueError("trans_depth 和 tcn_depth 必须 >= 1")
+        if len(temporal_kernels) != 3:
+            raise ValueError("论文配置使用 3 个时间卷积分支")
 
-        self.n_classes = n_classes
         self.channels = channels
         self.samples = samples
+        self.n_classes = n_classes
+        self.groups = len(temporal_kernels)
+        model_dim = group_dim * self.groups
 
-        self.n_groups = len(temp_kernel_lengths)
-        self.d_model = d_group * self.n_groups
-
-        if self.d_model % q_heads or q_heads % kv_heads:
-            raise ValueError(
-                "d_model 必须被 q_heads 整除，"
-                "且 q_heads 必须被 kv_heads 整除"
-            )
-
-        if (self.d_model // q_heads) % 2:
-            raise ValueError(
-                "每个注意力头的 head_dim 必须为偶数"
-            )
-
-        if trans_depth < 1:
-            raise ValueError("trans_depth 必须 >= 1")
-
-        # 1. Multi-Kernel CNN
-        self.conv_block = MultiKernelConvBlock(
-            channels,
-            temp_kernel_lengths,
-            F1,
-            D,
-            pool_length_1,
-            pool_length_2,
-            dropout_conv,
-            d_group,
-            use_group_attn
+        self.stem = _ITCFConvStem(
+            channels, temporal_kernels, f1, depth_multiplier,
+            group_dim, pool1, pool2, conv_dropout
         )
-
-        # 2. CNN 特征混合
         self.mix = nn.Sequential(
-            nn.Conv1d(
-                self.d_model, self.d_model,
-                kernel_size=1, bias=False
-            ),
-            nn.BatchNorm1d(self.d_model),
+            nn.Conv1d(model_dim, model_dim, 1, bias=False),
+            nn.BatchNorm1d(model_dim),
             nn.SiLU(),
         )
 
-        # 3. Transformer Encoder
-        drop_rates = (
-            torch.linspace(0, 1, trans_depth) ** 2
-            * drop_path_max
-        ).tolist()
-
+        rates = torch.linspace(0, 1, trans_depth).square() * drop_path_max
         self.transformer = nn.ModuleList([
-            TransformerBlock(
-                self.d_model,
-                q_heads,
-                kv_heads,
-                trans_dropout,
-                drop_rates[i]
+            _ITCFTransformerBlock(
+                model_dim, q_heads, kv_heads,
+                trans_dropout, rates[i].item()
             )
             for i in range(trans_depth)
         ])
-
-        # 4. Transformer 特征降维
         self.reduce = nn.Sequential(
-            nn.Conv1d(
-                self.d_model, d_group,
-                kernel_size=1, bias=False
-            ),
-            nn.BatchNorm1d(d_group),
+            nn.Conv1d(model_dim, group_dim, 1, bias=False),
+            nn.BatchNorm1d(group_dim),
             nn.SiLU(),
         )
 
-        # 5. TCN 分类器
-        self.tcn_head = TCNHead(
-            d_group * (self.n_groups + 1),
-            self.n_groups + 1,
-            tcn_depth,
-            kernel_length_tcn,
-            dropout_tcn,
-            n_classes
+        features = group_dim * (self.groups + 1)
+        tcn_groups = self.groups + 1
+        self.tcn = nn.Sequential(*[
+            _ITCFTCNBlock(
+                features, tcn_groups, tcn_kernel,
+                dilation=2 ** i, dropout=tcn_dropout
+            )
+            for i in range(tcn_depth)
+        ])
+        self.classifier = _ITCFMaxNormConv1d(
+            features, n_classes * tcn_groups, 1,
+            groups=tcn_groups, max_norm=0.25
         )
+
+        self.register_buffer("_rope_cos", None, persistent=False)
+        self.register_buffer("_rope_sin", None, persistent=False)
 
     def forward(self, x):
-
-        # 支持 (B,1,C,T) 输入
-        if x.ndim == 4:
-            if x.shape[1] != 1:
-                raise ValueError(
-                    "四维输入应为 (B,1,channels,time)"
-                )
+        if x.ndim == 4 and x.shape[1] == 1:
             x = x.squeeze(1)
-
         if x.ndim != 3 or x.shape[1] != self.channels:
             raise ValueError(
-                f"输入应为 (B,{self.channels},T) "
+                f"输入必须是 (B,{self.channels},T) "
                 f"或 (B,1,{self.channels},T)"
             )
+        if x.shape[-1] < 56:
+            raise ValueError("时间长度 T 必须 >= pool1 * pool2 = 56")
 
-        # CNN Feature Extraction
-        cnn_features = self.conv_block(x)
+        conv_features = self.stem(x)
+        tokens = self.mix(conv_features).transpose(1, 2)
 
-        # (B,C,T) -> (B,T,C)
-        tokens = self.mix(
-            cnn_features
-        ).transpose(1, 2)
+        length = tokens.shape[1]
+        head_dim = self.transformer[0].attention.head_dim
+        if (
+            self._rope_cos is None
+            or self._rope_cos.shape[0] < length
+            or self._rope_cos.device != tokens.device
+        ):
+            self._rope_cos, self._rope_sin = _itcf_rotary_cache(
+                head_dim, length, tokens.device
+            )
 
-        # Rotary Position Embedding
-        cos, sin = rotary_cache(
-            tokens.shape[1],
-            self.d_model
-            // self.transformer[0].attention.q_heads,
-            tokens.device
+        for block in self.transformer:
+            tokens = block(tokens, self._rope_cos, self._rope_sin)
+
+        transformer_features = self.reduce(tokens.transpose(1, 2))
+        features = torch.cat(
+            (conv_features, transformer_features), dim=1
         )
+        features = self.tcn(features)[:, :, -1:]
+        logits = self.classifier(features)
+        logits = logits.squeeze(-1)
+        return logits.reshape(
+            x.shape[0], self.groups + 1, self.n_classes
+        ).mean(dim=1)
 
-        # Transformer Encoder
-        for layer in self.transformer:
-            tokens = layer(tokens, cos, sin)
-
-        # Transformer Features
-        transformer_features = self.reduce(
-            tokens.transpose(1, 2)
-        )
-
-        # CNN + Transformer Feature Fusion
-        fused = torch.cat(
-            (cnn_features, transformer_features),
-            dim=1
-        )
-
-        # TCN Classification
-        return self.tcn_head(fused)
 
 
 
@@ -1759,6 +1526,10 @@ class MCTGNet(nn.Module):
 
         # Return raw logits for CrossEntropyLoss
         return logits
+
+
+
+
 
 
 
